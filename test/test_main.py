@@ -9,7 +9,7 @@ client = TestClient(app)
 def test_home():
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json() == {"message": "Sales AI is running"}
+    assert response.json() == {"message": "Sales AI CI/CD is running"}
 
 
 def test_health():
