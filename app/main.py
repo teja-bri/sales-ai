@@ -1,8 +1,14 @@
+import logging
 import re
 from pathlib import Path
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+
+from app.rag_store import search_sales_knowledge
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Sales AI",
@@ -34,6 +40,8 @@ def health():
 
 @app.post("/analyze-opportunity")
 def analyze_opportunity(opportunity: OpportunityRequest):
+    logger.info("Analyzing opportunity: %s", opportunity.opportunity_name)
+
     if opportunity.probability >= 70:
         risk_level = "low"
         recommended_action = "Prepare final proposal and confirm closing timeline."
@@ -103,14 +111,19 @@ def find_relevant_context(question: str, knowledge: str):
 
 @app.post("/rag-answer")
 def rag_answer(request: RagQuestion):
-    knowledge = load_sales_knowledge()
-    context = find_relevant_context(request.question, knowledge)
+    logger.info("Answering RAG question with vector search: %s", request.question)
+
+    context = search_sales_knowledge(request.question)
 
     if not context:
+        logger.warning("No relevant context found for question: %s", request.question)
+
         return {
             "answer": "I could not find relevant sales knowledge for this question.",
             "context": "",
         }
+
+    logger.info("Retrieved vector context for RAG question")
 
     return {
         "answer": f"Based on the sales knowledge: {context}",
