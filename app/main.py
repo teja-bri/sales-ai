@@ -1,14 +1,28 @@
 import logging
+import os
 import re
 from pathlib import Path
 
+import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI
+from langfuse import get_client
 from pydantic import BaseModel, Field
 
 from app.rag_store import search_sales_knowledge
 
+load_dotenv()
+
+if os.getenv("LANGFUSE_HOST") and not os.getenv("LANGFUSE_BASE_URL"):
+    os.environ["LANGFUSE_BASE_URL"] = os.getenv("LANGFUSE_HOST")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+langfuse = get_client()
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
 
 app = FastAPI(
     title="Sales AI",
@@ -109,23 +123,127 @@ def find_relevant_context(question: str, knowledge: str):
     return best_paragraph
 
 
+def build_rag_prompt(question: str, context: str):
+    return f"""
+You are a sales AI assistant. Answer only using the provided context.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer in 3 short bullet points. If the context is not enough, say what is missing.
+"""
+
+
 @app.post("/rag-answer")
 def rag_answer(request: RagQuestion):
     logger.info("Answering RAG question with vector search: %s", request.question)
 
-    context = search_sales_knowledge(request.question)
+    trace_id = langfuse.create_trace_id()
 
-    if not context:
-        logger.warning("No relevant context found for question: %s", request.question)
+    with langfuse.start_as_current_observation(
+        as_type="span",
+        name="rag-answer",
+        trace_context={"trace_id": trace_id},
+        input={"question": request.question},
+    ) as span:
+        context = search_sales_knowledge(request.question)
 
-        return {
-            "answer": "I could not find relevant sales knowledge for this question.",
-            "context": "",
+        if not context:
+            logger.warning("No relevant context found for question: %s", request.question)
+
+            output = {
+                "answer": "I could not find relevant sales knowledge for this question.",
+                "context": "",
+            }
+
+            span.update(output=output)
+
+            span.score(
+                name="retrieval_found",
+                value=0,
+                comment="RAG did not retrieve a context paragraph",
+            )
+
+            langfuse.flush()
+
+            return output
+
+        logger.info("Retrieved vector context for RAG question")
+
+        output = {
+            "answer": f"Based on the sales knowledge: {context}",
+            "context": context,
         }
 
-    logger.info("Retrieved vector context for RAG question")
+        span.update(
+            output=output,
+            metadata={"retrieved_context": context},
+        )
 
-    return {
-        "answer": f"Based on the sales knowledge: {context}",
-        "context": context,
-    }
+        span.score(
+            name="retrieval_found",
+            value=1,
+            comment="RAG retrieved a context paragraph",
+        )
+
+        langfuse.flush()
+
+        return output
+
+
+@app.post("/rag-generate")
+async def rag_generate(request: RagQuestion):
+    logger.info("Generating RAG answer with Qwen: %s", request.question)
+
+    trace_id = langfuse.create_trace_id()
+
+    with langfuse.start_as_current_observation(
+        as_type="span",
+        name="rag-generate",
+        trace_context={"trace_id": trace_id},
+        input={"question": request.question},
+    ) as span:
+        context = search_sales_knowledge(request.question)
+        prompt = build_rag_prompt(request.question, context)
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.2,
+                        "top_p": 0.9,
+                        "num_predict": 250,
+                    },
+                },
+            )
+
+        response.raise_for_status()
+        llm_output = response.json()["response"]
+
+        output = {
+            "answer": llm_output,
+            "context": context,
+            "model": OLLAMA_MODEL,
+        }
+
+        span.update(
+            output=output,
+            metadata={
+                "retrieved_context": context,
+                "model": OLLAMA_MODEL,
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "num_predict": 250,
+            },
+        )
+
+        langfuse.flush()
+
+        return output
